@@ -28,4 +28,6 @@ export const api = {
     req("/leases/open", { method: "POST", body: JSON.stringify({ session_code }) }),
   closeLease: (lease_no) =>
     req("/leases/close", { method: "POST", body: JSON.stringify({ lease_no }) }),
+  rebindSession: (code, patch) =>
+    req(`/sessions/${code}/rebind`, { method: "POST", body: JSON.stringify(patch) }),
 };

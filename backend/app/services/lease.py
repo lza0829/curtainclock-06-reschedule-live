@@ -29,6 +29,43 @@ def _conflict_mode(conn: sqlite3.Connection) -> str:
     return row["value"] if row else "reject"
 
 
+def record_conflicts(
+    conn: sqlite3.Connection, session: sqlite3.Row | dict, reasons: list[str]
+) -> None:
+    """冲突落冲突桶并抬水位：开窗与改挂共用的唯一入口（同源）。"""
+    for reason in reasons:
+        kind = "room" if "算力槽" in reason else ("teacher" if "执行器" in reason else "ready")
+        resource = (
+            session["room_code"]
+            if kind == "room"
+            else (session["teacher_code"] if kind == "teacher" else session["code"])
+        )
+        conn.execute(
+            "INSERT INTO conflicts(kind, session_code, resource_code, day, start_min, end_min, reason, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                kind,
+                session["code"],
+                resource,
+                session["day"],
+                session["start_min"],
+                session["end_min"],
+                reason,
+                _now(),
+            ),
+        )
+        _bump(conn, "conflict_count", 1)
+
+
+class RebindConflict(Exception):
+    """live 改挂与他窗重叠或未就绪：整笔回滚不改库，由路由层另开事务落冲突桶。"""
+
+    def __init__(self, reasons: list[str], attempt: dict):
+        super().__init__("；".join(reasons))
+        self.reasons = reasons
+        self.attempt = attempt
+
+
 def open_lease(conn: sqlite3.Connection, session_code: str) -> dict:
     session = conn.execute(
         "SELECT * FROM sessions WHERE code=?", (session_code,)
@@ -43,28 +80,7 @@ def open_lease(conn: sqlite3.Connection, session_code: str) -> dict:
     ready = readiness(conn, session)
     if not ready["ready"]:
         mode = _conflict_mode(conn)
-        for reason in ready["reasons"]:
-            kind = "room" if "算力槽" in reason else ("teacher" if "执行器" in reason else "ready")
-            resource = (
-                session["room_code"]
-                if kind == "room"
-                else (session["teacher_code"] if kind == "teacher" else session_code)
-            )
-            conn.execute(
-                "INSERT INTO conflicts(kind, session_code, resource_code, day, start_min, end_min, reason, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    kind,
-                    session_code,
-                    resource,
-                    session["day"],
-                    session["start_min"],
-                    session["end_min"],
-                    reason,
-                    _now(),
-                ),
-            )
-            _bump(conn, "conflict_count", 1)
+        record_conflicts(conn, session, ready["reasons"])
         # 底座贯彻 reject（冲突落库后由调用方提交）；候补算力槽留给后续题
         return {
             "ok": False,
@@ -141,3 +157,82 @@ def close_lease(conn: sqlite3.Connection, lease_no: str) -> dict:
         "status": "closed",
         "open_leases": open_n,
     }
+
+
+def rebind_session(
+    conn: sqlite3.Connection, session_code: str, patch: dict
+) -> dict:
+    """改挂唯一入口，全局贯彻「同事务改挂」臂：
+
+    - draft：仅改批窗定义，无租约可动；
+    - live：定义行与 open 租约行在同一事务内同步改挂时段与资源码，
+      占用索引（leases 行）随资源码移动，不留旧资源幽灵占用；
+      与他窗重叠或未就绪则抛 RebindConflict，整笔回滚、不改库；
+    - done：定义封存，禁止改挂。
+
+    就绪/重叠预检与开窗同源（readiness，排除本窗自身 open 租约）。
+    """
+    session = conn.execute(
+        "SELECT * FROM sessions WHERE code=?", (session_code,)
+    ).fetchone()
+    if session is None:
+        raise LookupError(f"批窗不存在：{session_code}")
+    if session["status"] == "done":
+        raise ValueError("批窗已结束，定义封存，禁止改挂")
+
+    new = {
+        "room_code": patch.get("room_code", session["room_code"]),
+        "teacher_code": patch.get("teacher_code", session["teacher_code"]),
+        "day": patch.get("day", session["day"]),
+        "start_min": patch.get("start_min", session["start_min"]),
+        "end_min": patch.get("end_min", session["end_min"]),
+    }
+    if new["end_min"] <= new["start_min"]:
+        raise ValueError("结束时刻必须晚于开始时刻")
+
+    if session["status"] == "live":
+        attempt = {"code": session_code, **new}
+        ready = readiness(conn, attempt)
+        if not ready["ready"]:
+            raise RebindConflict(ready["reasons"], attempt)
+        conn.execute(
+            "UPDATE sessions SET room_code=?, teacher_code=?, day=?, start_min=?, end_min=? "
+            "WHERE code=? AND status='live'",
+            (
+                new["room_code"],
+                new["teacher_code"],
+                new["day"],
+                new["start_min"],
+                new["end_min"],
+                session_code,
+            ),
+        )
+        cur = conn.execute(
+            "UPDATE leases SET room_code=?, teacher_code=?, day=?, start_min=?, end_min=? "
+            "WHERE session_code=? AND status='open'",
+            (
+                new["room_code"],
+                new["teacher_code"],
+                new["day"],
+                new["start_min"],
+                new["end_min"],
+                session_code,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("live 批窗缺唯一 open 租约，定义与占用已撕裂")
+        return {"ok": True, "mode": "live_rebind", "session_code": session_code, **new}
+
+    conn.execute(
+        "UPDATE sessions SET room_code=?, teacher_code=?, day=?, start_min=?, end_min=? "
+        "WHERE code=? AND status='draft'",
+        (
+            new["room_code"],
+            new["teacher_code"],
+            new["day"],
+            new["start_min"],
+            new["end_min"],
+            session_code,
+        ),
+    )
+    return {"ok": True, "mode": "draft_edit", "session_code": session_code, **new}
